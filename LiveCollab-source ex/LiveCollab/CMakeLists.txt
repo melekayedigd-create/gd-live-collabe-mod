@@ -10,15 +10,12 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 project(LiveCollab VERSION 1.0.0)
 
-add_library(${PROJECT_NAME} SHARED
-    src/main.cpp
-    src/Net.cpp
-    src/Session.cpp
-)
+file(GLOB SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
+add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 # Net.cpp includes the Windows networking headers itself; Geode's precompiled
 # header already pulls in the old <winsock.h>, which clashes with <winsock2.h>.
-set_source_files_properties(src/Net.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/Net.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 if (WIN32)
     target_link_libraries(${PROJECT_NAME} ws2_32)

@@ -6,7 +6,7 @@
 	},
 	"id": "myriam.live-collab",
 	"name": "Live Collab",
-	"version": "v1.0.0",
+	"version": "v1.1.0",
 	"developer": "Myriam",
 	"description": "Build levels with a friend in real time: Host or Join a room from the main menu.",
 	"tags": ["editor", "online", "utility"]
