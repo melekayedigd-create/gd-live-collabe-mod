@@ -16,6 +16,10 @@ add_library(${PROJECT_NAME} SHARED
     src/Session.cpp
 )
 
+# Net.cpp includes the Windows networking headers itself; Geode's precompiled
+# header already pulls in the old <winsock.h>, which clashes with <winsock2.h>.
+set_source_files_properties(src/Net.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+
 if (WIN32)
     target_link_libraries(${PROJECT_NAME} ws2_32)
 endif()
