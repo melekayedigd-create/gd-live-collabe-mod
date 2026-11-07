@@ -1,5 +1,9 @@
 #include "Session.hpp"
 
+   #include <cstdio>
+   #include <cstdlib>
+   #include <iterator>
+
 #include <thread>
 #include <chrono>
 #include <random>
