@@ -33,6 +33,7 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         with:
           combine: true
+          sdk: v5.11.2
           target: ${{ matrix.config.target }}
           path: "LiveCollab-source ex/LiveCollab"
 
