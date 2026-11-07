@@ -1,0 +1,13 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"android": "2.2081",
+		"win": "2.2081"
+	},
+	"id": "myriam.live-collab",
+	"name": "Live Collab",
+	"version": "v1.0.0",
+	"developer": "Myriam",
+	"description": "Build levels with a friend in real time: Host or Join a room from the main menu.",
+	"tags": ["editor", "online", "utility"]
+}
