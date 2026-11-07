@@ -1,13 +1,12 @@
 #include "Session.hpp"
 
-   #include <cstdio>
-   #include <cstdlib>
-   #include <iterator>
-
 #include <thread>
 #include <chrono>
 #include <random>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
 
 namespace collab {
 
@@ -60,6 +59,8 @@ std::string Session::room() { std::lock_guard l(m_mutex); return m_room; }
 std::string Session::myId() { std::lock_guard l(m_mutex); return m_myId; }
 std::string Session::server() { std::lock_guard l(m_mutex); return m_server; }
 std::string Session::lastError() { std::lock_guard l(m_mutex); return m_lastError; }
+void Session::setName(std::string const& name) { std::lock_guard l(m_mutex); m_name = name.empty() ? "Player" : name; }
+std::string Session::name() { std::lock_guard l(m_mutex); return m_name; }
 
 void Session::host() { start(makeCode(), true); }
 
@@ -157,15 +158,16 @@ void Session::send(char type, std::string const& body) {
 
 void Session::deliver(Message msg) {
     bool isHost = m_isHost;
+    std::string who = msg.body.empty() ? std::string("Your friend") : msg.body;
     if (msg.type == 'J') {
-        notice(isHost ? "Your friend joined the room!" : "Another player joined the room");
-        if (isHost) send('W', "");
+        notice(who + " joined the room!");
+        if (isHost) send('W', name());
     }
     else if (msg.type == 'W' && !isHost) {
-        notice("Connected to your friend's room!");
+        notice("Connected to " + who + "'s room!");
     }
     else if (msg.type == 'B') {
-        notice(msg.sender.empty() ? "A player left" : "Your friend left the room");
+        notice("A player left the room");
     }
     std::lock_guard l(m_mutex);
     if (m_inbox.size() < kMaxInbox) m_inbox.push_back(std::move(msg));
@@ -269,7 +271,7 @@ void Session::run(std::string room, bool isHost, uint64_t gen) {
             notice("Reconnected");
         }
         everConnected = true;
-        if (!isHost) send('J', "");
+        if (!isHost) send('J', name());
 
         auto lastPing = std::chrono::steady_clock::now();
         while (current(gen)) {

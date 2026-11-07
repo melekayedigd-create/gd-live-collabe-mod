@@ -1,47 +1,238 @@
 // Live Collab — build levels together with a friend in real time.
 //
 //  Main menu:  [Host]  -> creates a room and shows a 6-letter code
-//              [Join]  -> type your friend's code
-//  Then both players open a level in the editor. The host's level is sent to
-//  the friend, and every object placed / moved / edited / deleted by either
-//  player appears on the other screen.
+//              [Join]  -> type your friend's code; the host's level opens
+//                         automatically in the editor (same song, colors...)
+//  Editor:     live object sync, a movable chat button, and boxes + names
+//              around what the other player is selecting / building.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
-#include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
-#include <Geode/utils/cocos.hpp>
-#include <unordered_set>
+#include <chrono>
 
-#include "Session.hpp"
-#include "SyncLogic.hpp"
+#include "Collab.hpp"
 
 using namespace geode::prelude;
-using collab::Session;
 
-// ---------------------------------------------------------------------------
-// Shows connection events ("Your friend joined!") anywhere in the game
-// ---------------------------------------------------------------------------
+namespace collab {
+
+Globals& G() {
+    static Globals g;
+    return g;
+}
+
+double now() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+std::string myName() {
+    std::string name = GameManager::get()->m_playerName;
+    if (name.empty()) name = "Player";
+    return name;
+}
+
+std::string nameOf(std::string const& sender) {
+    auto it = G().players.find(sender);
+    return it == G().players.end() ? std::string("Friend") : it->second.name;
+}
+
+cocos2d::ccColor4F colorFor(std::string const& sender) {
+    static const cocos2d::ccColor4F palette[] = {
+        { 1.f, .35f, .35f, 1.f }, { .3f, .75f, 1.f, 1.f }, { 1.f, .8f, .2f, 1.f },
+        { .45f, 1.f, .45f, 1.f }, { .85f, .45f, 1.f, 1.f }, { 1.f, .55f, .15f, 1.f },
+    };
+    size_t h = std::hash<std::string>{}(sender);
+    return palette[h % 6];
+}
+
+void addChatLine(std::string const& name, std::string const& text, bool mine) {
+    auto& chat = G().chat;
+    chat.push_back({ name, text, mine });
+    if (chat.size() > 60) chat.erase(chat.begin(), chat.begin() + (chat.size() - 60));
+}
+
+// "2\n<audioTrack>\n<songID>\n<songIDs>\n<sfxIDs>\n<compressed level>"
+std::string encodeFull(FullLevel const& l) {
+    return "2\n" + std::to_string(l.audioTrack) + "\n" + std::to_string(l.songID) + "\n" +
+        l.songIDs + "\n" + l.sfxIDs + "\n" + l.compressed;
+}
+
+bool decodeFull(std::string const& body, FullLevel& out) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    for (int i = 0; i < 5; i++) {
+        size_t nl = body.find('\n', start);
+        if (nl == std::string::npos) return false;
+        parts.push_back(body.substr(start, nl - start));
+        start = nl + 1;
+    }
+    if (parts[0] != "2") return false;
+    out.audioTrack = std::atoi(parts[1].c_str());
+    out.songID = std::atoi(parts[2].c_str());
+    out.songIDs = parts[3];
+    out.sfxIDs = parts[4];
+    out.compressed = body.substr(start);
+    return true;
+}
+
+static void closeWaitingPopup() {
+    auto& g = G();
+    if (g.waitingPopup) {
+        g.closingWaiting = true;
+        if (g.waitingPopup->getParent()) g.waitingPopup->keyBackClicked();
+        g.closingWaiting = false;
+        g.waitingPopup = nullptr;
+    }
+}
+
+// Guest: create (or reuse) a level for this room and open it in the editor
+static void openCollabLevel(FullLevel const& full) {
+    auto& g = G();
+    auto room = Session::get().room();
+    GJGameLevel* level = g.collabLevel;
+    if (!level || g.collabRoom != room) {
+        level = GameLevelManager::get()->createNewLevel();
+        if (!level) return;
+        g.collabLevel = level;
+        g.collabRoom = room;
+    }
+    std::string title = "Collab " + room;
+    level->m_levelName = title;
+    level->m_levelString = full.compressed;
+    level->m_audioTrack = full.audioTrack;
+    level->m_songID = full.songID;
+    level->m_songIDs = full.songIDs;
+    level->m_sfxIDs = full.sfxIDs;
+
+    g.freshLevel = true;
+    closeWaitingPopup();
+    CCDirector::get()->replaceScene(CCTransitionFade::create(.5f, LevelEditorLayer::scene(level, false)));
+}
+
+static void handleFullLevel(Message&& msg) {
+    FullLevel full;
+    if (!decodeFull(msg.body, full)) return;
+    auto& g = G();
+    if (LevelEditorLayer::get()) {
+        // Already in the editor: the editor replaces its objects in place
+        g.editorQueue.push_back(std::move(msg));
+        closeWaitingPopup();
+        return;
+    }
+    if (PlayLayer::get()) {
+        // Playing a level right now: open the editor when they leave it
+        g.pendingFull = std::move(full);
+        g.hasPendingFull = true;
+        Notification::create("Your friend's level is ready - exit this level to join", NotificationIcon::Info, 3.f)->show();
+        return;
+    }
+    openCollabLevel(full);
+}
+
+// Runs all the time (menu, editor, anywhere): receives messages and shows events
 class CollabPump : public CCObject {
 public:
-    static void ensure() {
-        static CollabPump* pump = nullptr;
-        if (pump) return;
-        pump = new CollabPump(); // lives for the whole game session
-        CCDirector::get()->getScheduler()->scheduleSelector(
-            schedule_selector(CollabPump::tick), pump, 0.3f, false
-        );
-    }
-
     void tick(float) {
-        for (auto const& text : Session::get().drainNotices()) {
+        auto& s = Session::get();
+        auto& g = G();
+
+        for (auto const& text : s.drainNotices()) {
             bool bad = text.find("failed") != std::string::npos || text.find("lost") != std::string::npos;
             Notification::create(text, bad ? NotificationIcon::Error : NotificationIcon::Info, 2.5f)->show();
         }
+
+        if (!s.active()) {
+            g.players.clear();
+            g.editorQueue.clear();
+            g.flashes.clear();
+            g.hasPendingFull = false;
+            return;
+        }
+
+        bool inEditor = LevelEditorLayer::get() != nullptr;
+        for (auto& msg : s.drain()) {
+            auto& player = g.players[msg.sender];
+            player.lastSeen = now();
+            switch (msg.type) {
+                case 'J':
+                case 'W':
+                    if (!msg.body.empty()) player.name = msg.body;
+                    if (msg.type == 'J' && inEditor) g.editorQueue.push_back(std::move(msg));
+                    break;
+                case 'B':
+                    g.players.erase(msg.sender);
+                    break;
+                case 'C': {
+                    auto nl = msg.body.find('\n');
+                    if (nl == std::string::npos) break;
+                    player.name = msg.body.substr(0, nl);
+                    auto text = msg.body.substr(nl + 1);
+                    addChatLine(player.name, text, false);
+                    if (!chatIsShowing()) {
+                        g.unread++;
+                        Notification::create(player.name + ": " + text, NotificationIcon::None, 2.5f)->show();
+                    }
+                    break;
+                }
+                case 'S': {
+                    auto nl = msg.body.find('\n');
+                    if (nl == std::string::npos) break;
+                    player.name = msg.body.substr(0, nl);
+                    player.selection.clear();
+                    size_t pos = nl + 1;
+                    while (pos < msg.body.size()) {
+                        size_t end = msg.body.find(';', pos);
+                        if (end == std::string::npos) end = msg.body.size();
+                        float x, y, w, h;
+                        if (std::sscanf(msg.body.c_str() + pos, "%f,%f,%f,%f", &x, &y, &w, &h) == 4) {
+                            player.selection.push_back(CCRect(x, y, w, h));
+                        }
+                        pos = end + 1;
+                    }
+                    break;
+                }
+                case 'F':
+                    if (!s.isHost()) handleFullLevel(std::move(msg));
+                    break;
+                case 'D':
+                case 'R':
+                    if (inEditor) g.editorQueue.push_back(std::move(msg));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        // Forget players we haven't heard from in a while
+        for (auto it = g.players.begin(); it != g.players.end();) {
+            if (now() - it->second.lastSeen > 30.0) it = g.players.erase(it);
+            else ++it;
+        }
+        if (!inEditor) {
+            g.editorQueue.clear();
+            g.flashes.clear();
+            if (g.hasPendingFull && !PlayLayer::get()) {
+                g.hasPendingFull = false;
+                openCollabLevel(g.pendingFull);
+            }
+        }
     }
 };
+
+void ensurePump() {
+    static CollabPump* pump = nullptr;
+    if (pump) return;
+    pump = new CollabPump(); // lives for the whole game session
+    CCDirector::get()->getScheduler()->scheduleSelector(schedule_selector(CollabPump::tick), pump, 0.1f, false);
+}
+
+} // namespace collab
+
+using namespace collab;
 
 static void askLeaveRoom() {
     auto& s = Session::get();
@@ -56,6 +247,24 @@ static void askLeaveRoom() {
             }
         }
     );
+}
+
+static void showWaitingPopup(std::string const& code) {
+    auto popup = createQuickPopup(
+        "Joining...",
+        fmt::format(
+            "Room <cy>{}</c>\n\nWaiting for your friend to open a level in the <cg>editor</c>.\n"
+            "It will open here automatically.",
+            code
+        ),
+        "Cancel", nullptr,
+        [](FLAlertLayer*, bool) {
+            if (G().closingWaiting) return;
+            G().waitingPopup = nullptr;
+            Session::get().leave();
+        }
+    );
+    G().waitingPopup = popup;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,17 +313,10 @@ protected:
             FLAlertLayer::create("Oops", "A room code has <cy>6</c> letters/numbers.\nAsk your friend to send it again.", "OK")->show();
             return;
         }
+        Session::get().setName(myName());
         Session::get().join(code);
         this->onClose(nullptr);
-        FLAlertLayer::create(
-            "Joining...",
-            fmt::format(
-                "Connecting to room <cy>{}</c>.\n\nNow <cg>create a new empty level</c> and open it in the "
-                "<cg>editor</c>. Your friend's level will appear there automatically.",
-                code
-            ),
-            "OK"
-        )->show();
+        showWaitingPopup(code);
     }
 
 public:
@@ -135,7 +337,7 @@ public:
 class $modify(CollabMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
-        CollabPump::ensure();
+        ensurePump();
 
         auto hostBtn = CCMenuItemSpriteExtra::create(
             ButtonSprite::create("Host", "goldFont.fnt", "GJ_button_01.png", .7f),
@@ -149,7 +351,6 @@ class $modify(CollabMenuLayer, MenuLayer) {
         );
         joinBtn->setID("join-button"_spr);
 
-        // Our own small menu on the left side, so it never hides game buttons
         auto win = CCDirector::get()->getWinSize();
         auto menu = CCMenu::create();
         menu->setID("live-collab-menu"_spr);
@@ -171,6 +372,7 @@ class $modify(CollabMenuLayer, MenuLayer) {
     void onCollabHost(CCObject*) {
         auto& s = Session::get();
         if (s.active()) { askLeaveRoom(); return; }
+        s.setName(myName());
         s.host();
         auto code = s.room();
         clipboard::write(code);
@@ -188,189 +390,5 @@ class $modify(CollabMenuLayer, MenuLayer) {
     void onCollabJoin(CCObject*) {
         if (Session::get().active()) { askLeaveRoom(); return; }
         if (auto popup = JoinPopup::create()) popup->show();
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Editor: live sync of objects
-// ---------------------------------------------------------------------------
-class $modify(CollabEditor, LevelEditorLayer) {
-    struct Fields {
-        collab::Counts baseline;
-        bool wasConnected = false;
-        bool gotLevel = false;
-        float sinceRequest = 0.f;
-        CCLabelBMFont* label = nullptr;
-    };
-
-    bool init(GJGameLevel* level, bool noUI) {
-        if (!LevelEditorLayer::init(level, noUI)) return false;
-
-        auto win = CCDirector::get()->getWinSize();
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(.28f);
-        label->setOpacity(200);
-        label->setPosition({ win.width / 2.f, win.height - 8.f });
-        label->setID("status-label"_spr);
-        this->addChild(label, 1000);
-        m_fields->label = label;
-
-        m_fields->baseline = this->collabCounts(this->collabSnapshot());
-        Session::get().clearInbox(); // changes made before we entered are covered by the full level
-        this->schedule(schedule_selector(CollabEditor::collabTick), 0.4f);
-        return true;
-    }
-
-    std::vector<std::pair<GameObject*, std::string>> collabSnapshot() {
-        std::vector<std::pair<GameObject*, std::string>> out;
-        if (!m_objects) return out;
-        out.reserve(m_objects->count());
-        for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-            if (!obj) continue;
-            std::string str = obj->getSaveString(this);
-            out.emplace_back(obj, std::move(str));
-        }
-        return out;
-    }
-
-    collab::Counts collabCounts(std::vector<std::pair<GameObject*, std::string>> const& snap) {
-        collab::Counts c;
-        c.reserve(snap.size());
-        for (auto const& [obj, str] : snap) c[str]++;
-        return c;
-    }
-
-    void collabSendFullLevel(std::vector<std::pair<GameObject*, std::string>> const& snap) {
-        std::string level;
-        for (auto const& [obj, str] : snap) { level += str; level += ';'; }
-        std::string packed;
-        if (!level.empty()) {
-            gd::string zipped = ZipUtils::compressString(level, false, 0);
-            packed = zipped;
-        }
-        Session::get().send('F', packed);
-    }
-
-    void collabRemove(GameObject* obj) {
-        if (m_editorUI && obj->m_isSelected) m_editorUI->deselectObject(obj);
-        this->removeObject(obj, true);
-    }
-
-    void collabApplyFull(std::string const& packed) {
-        if (m_editorUI) m_editorUI->deselectAll();
-        auto snap = this->collabSnapshot();
-        for (auto const& [obj, str] : snap) this->removeObject(obj, true);
-        if (!packed.empty()) {
-            gd::string unzipped = ZipUtils::decompressString(packed, false, 0);
-            std::string level = unzipped;
-            if (!level.empty()) this->createObjectsFromString(level, true, true);
-        }
-        if (m_editorUI) m_editorUI->updateButtons();
-    }
-
-    void collabApplyDiff(std::string const& body) {
-        auto diff = collab::decodeDiff(body);
-        if (diff.empty()) return;
-
-        if (!diff.removed.empty()) {
-            auto snap = this->collabSnapshot();
-            std::unordered_map<std::string, std::vector<GameObject*>> exact, loose;
-            for (auto const& [obj, str] : snap) {
-                exact[str].push_back(obj);
-                loose[collab::signatureOf(str)].push_back(obj);
-            }
-            std::unordered_set<GameObject*> gone;
-            auto take = [&](std::vector<GameObject*>& list) -> GameObject* {
-                while (!list.empty()) {
-                    auto obj = list.back();
-                    list.pop_back();
-                    if (!gone.count(obj)) return obj;
-                }
-                return nullptr;
-            };
-            for (auto const& str : diff.removed) {
-                GameObject* obj = nullptr;
-                if (auto it = exact.find(str); it != exact.end()) obj = take(it->second);
-                if (!obj) {
-                    if (auto it = loose.find(collab::signatureOf(str)); it != loose.end()) obj = take(it->second);
-                }
-                if (obj) {
-                    gone.insert(obj);
-                    this->collabRemove(obj);
-                }
-            }
-        }
-
-        if (!diff.added.empty()) {
-            std::string joined;
-            for (auto const& s : diff.added) { joined += s; joined += ';'; }
-            this->createObjectsFromString(joined, true, true);
-        }
-    }
-
-    void collabTick(float dt) {
-        auto& s = Session::get();
-        auto& f = m_fields;
-        bool connected = s.state() == collab::State::Connected;
-
-        if (f->label) {
-            if (!s.active()) f->label->setString("");
-            else if (!connected) f->label->setString(fmt::format("Live Collab: connecting to room {}...", s.room()).c_str());
-            else f->label->setString(fmt::format("Live Collab: room {} ({})", s.room(), s.isHost() ? "host" : "guest").c_str());
-        }
-
-        if (!connected) { f->wasConnected = false; return; }
-        // Don't sync while play-testing: objects move around during the test
-        if (m_playbackMode != PlaybackMode::Not) return;
-
-        auto snap = this->collabSnapshot();
-
-        // Just connected (or entered the editor while connected)
-        if (!f->wasConnected) {
-            f->wasConnected = true;
-            f->sinceRequest = 0.f;
-            if (s.isHost()) this->collabSendFullLevel(snap);
-            else { f->gotLevel = false; s.send('R', ""); }
-        }
-
-        // 1) send what *I* changed since last time
-        auto current = this->collabCounts(snap);
-        auto diff = collab::computeDiff(f->baseline, current);
-        if (!diff.empty()) s.send('D', collab::encodeDiff(diff));
-        f->baseline = std::move(current);
-
-        // Guest: ask again for the level if the host wasn't in the editor yet
-        if (!s.isHost() && !f->gotLevel) {
-            f->sinceRequest += dt;
-            if (f->sinceRequest > 4.f) { f->sinceRequest = 0.f; s.send('R', ""); }
-        }
-
-        // 2) apply what my friend changed
-        bool changed = false;
-        for (auto& msg : s.drain()) {
-            switch (msg.type) {
-                case 'R':
-                case 'J':
-                    if (s.isHost()) this->collabSendFullLevel(snap);
-                    break;
-                case 'F':
-                    if (!s.isHost()) {
-                        this->collabApplyFull(msg.body);
-                        f->gotLevel = true;
-                        changed = true;
-                        Notification::create("Level received from the host!", NotificationIcon::Success, 2.f)->show();
-                    }
-                    break;
-                case 'D':
-                    this->collabApplyDiff(msg.body);
-                    changed = true;
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        // Objects created by my friend are not "my" changes: don't send them back
-        if (changed) f->baseline = this->collabCounts(this->collabSnapshot());
     }
 };

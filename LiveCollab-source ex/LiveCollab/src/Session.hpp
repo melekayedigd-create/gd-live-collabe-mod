@@ -19,7 +19,8 @@ namespace collab {
 enum class State { Off, Connecting, Connected, Failed };
 
 // Message types exchanged between players
-//  'J' joiner says hello            'W' host answers "welcome"
+//  'J' joiner says hello (name)     'W' host answers "welcome" (name)
+//  'C' chat (name\ntext)            'S' selected objects (name\nrects)
 //  'R' "please send me the level"   'F' full level (compressed)
 //  'D' object changes (diff)        'B' player left
 //  'P' piece of a big message (internal, reassembled automatically)
@@ -44,6 +45,10 @@ public:
     std::string myId();
     std::string server();
     std::string lastError();
+
+    // The name shown to the other players (GD username)
+    void setName(std::string const& name);
+    std::string name();
 
     // Sends a message to everyone else in the room (large messages are split automatically).
     void send(char type, std::string const& body);
@@ -80,6 +85,7 @@ private:
     std::string m_myId;
     std::string m_topic;
     std::string m_server;
+    std::string m_name = "Player";
     uint32_t m_nextMsgId = 1;
     std::deque<Message> m_inbox;
     std::vector<std::string> m_notices;
